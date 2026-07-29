@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+동적 손동작 인식 - 최소 파이프라인 (MediaPipe HandLandmarker + 시퀀스 분류)
+
+준비:
+    pip install mediapipe opencv-python scikit-learn numpy
+    # 공식 문서의 hand_landmarker 모델 내려받기
+    # https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker
+    wget -O hand_landmarker.task \
+      https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+
+사용:
+    python gesture.py collect --label swipe_left   # SPACE 누를 때마다 1회 녹화
+    python gesture.py collect --label swipe_right
+    python gesture.py collect --label idle         # ★ 아무것도 아닌 상태도 반드시 수집
+    python gesture.py train
+    python gesture.py run
+"""
+import argparse
+import glob
+import os
+import pickle
+import time
+from collections import deque
+
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision
+
+MODEL_PATH = "hand_landmarker.task"
+DATA_DIR = "data"
+CLF_PATH = "gesture_clf.pkl"
+
+SEQ_LEN = 30            # 한 동작의 길이(프레임). 30fps 기준 약 1초
+FEAT_DIM = 21 * 3 + 2   # 정규화 랜드마크 63 + 손목 절대좌표 2
+
+
+# ---------------------------------------------------------------- 랜드마크
+
+def make_landmarker():
+    if not os.path.exists(MODEL_PATH):
+        raise SystemExit(f"{MODEL_PATH} 가 없습니다. 위 주석의 wget 명령을 먼저 실행하세요.")
+    opts = vision.HandLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+    )
+    return vision.HandLandmarker.create_from_options(opts)
+
+
+def extract_feat(hand_landmarks):
+    """21개 랜드마크 -> 65차원 특징벡터.
+
+    손 '모양'은 손목 기준 상대좌표 + 손 크기 정규화로 카메라 거리에 불변하게 만들고,
+    손 '궤적'은 손목의 절대 위치를 따로 붙여서 보존한다.
+    (스와이프처럼 모양은 그대로인데 위치만 변하는 동작을 잡으려면 후자가 꼭 필요)
+    """
+    pts = np.array([[p.x, p.y, p.z] for p in hand_landmarks], dtype=np.float32)
+    wrist = pts[0].copy()
+    rel = pts - wrist
+    scale = float(np.linalg.norm(rel[9][:2])) + 1e-6   # 손목 -> 중지 MCP 거리
+    rel /= scale
+    return np.concatenate([rel.flatten(), wrist[:2]]).astype(np.float32)
+
+
+def frame_stream(landmarker, cap):
+    """(BGR 프레임, 특징벡터 or None) 을 계속 내보낸다."""
+    t0 = time.time()
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.flip(frame, 1)  # 거울 모드
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        ts_ms = int((time.time() - t0) * 1000)   # 반드시 단조 증가
+        res = landmarker.detect_for_video(mp_img, ts_ms)
+        feat = extract_feat(res.hand_landmarks[0]) if res.hand_landmarks else None
+        yield frame, feat
+
+
+# ---------------------------------------------------------------- 1) 수집
+
+def collect(label, n_samples):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    cap = cv2.VideoCapture(0)
+    landmarker = make_landmarker()
+
+    buf, recording, saved = [], False, 0
+    for frame, feat in frame_stream(landmarker, cap):
+        if recording:
+            buf.append(feat if feat is not None else np.zeros(FEAT_DIM, np.float32))
+            if len(buf) == SEQ_LEN:
+                fname = f"{DATA_DIR}/{label}_{saved:03d}_{int(time.time() * 1000)}.npy"
+                np.save(fname, np.array(buf, dtype=np.float32))
+                saved += 1
+                buf, recording = [], False
+
+        msg = f"[{label}] {saved}/{n_samples}  " + ("● REC" if recording else "SPACE=녹화 / Q=종료")
+        cv2.putText(frame, msg, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 0, 255) if recording else (0, 200, 0), 2)
+        cv2.imshow("collect", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord(" ") and not recording:
+            recording = True
+        if key == ord("q") or saved >= n_samples:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print(f"{label}: {saved}개 저장 완료")
+
+
+# ---------------------------------------------------------------- 2) 학습
+
+def train():
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.model_selection import cross_val_score
+
+    X, y = [], []
+    for path in sorted(glob.glob(f"{DATA_DIR}/*.npy")):
+        seq = np.load(path)
+        if seq.shape != (SEQ_LEN, FEAT_DIM):
+            print(f"건너뜀(길이 불일치): {path}")
+            continue
+        X.append(seq.flatten())
+        y.append(os.path.basename(path).rsplit("_", 2)[0])
+
+    if not X:
+        raise SystemExit("학습할 데이터가 없습니다. 먼저 collect 를 실행하세요.")
+
+    X, y = np.array(X), np.array(y)
+    classes, counts = np.unique(y, return_counts=True)
+    print("클래스별 샘플 수:", dict(zip(classes, counts)))
+    if len(classes) < 2:
+        raise SystemExit("최소 2개 클래스(idle 포함)가 필요합니다.")
+
+    clf = MLPClassifier(hidden_layer_sizes=(256, 128), max_iter=1000, random_state=0)
+    n_folds = int(min(5, counts.min()))
+    if n_folds >= 2:
+        scores = cross_val_score(clf, X, y, cv=n_folds)
+        print(f"교차검증 정확도: {scores.mean():.3f} (±{scores.std():.3f})")
+
+    clf.fit(X, y)
+    with open(CLF_PATH, "wb") as f:
+        pickle.dump(clf, f)
+    print(f"저장: {CLF_PATH}")
+
+
+# ---------------------------------------------------------------- 3) 실행
+
+def run(threshold=0.85, cooldown=1.0):
+    with open(CLF_PATH, "rb") as f:
+        clf = pickle.load(f)
+
+    cap = cv2.VideoCapture(0)
+    landmarker = make_landmarker()
+    buf = deque(maxlen=SEQ_LEN)
+    last_fire, shown = 0.0, "-"
+
+    for frame, feat in frame_stream(landmarker, cap):
+        buf.append(feat if feat is not None else np.zeros(FEAT_DIM, np.float32))
+
+        if len(buf) == SEQ_LEN:
+            prob = clf.predict_proba(np.array(buf).flatten()[None, :])[0]
+            i = int(prob.argmax())
+            label, conf = clf.classes_[i], prob[i]
+            if conf > threshold and label != "idle" and time.time() - last_fire > cooldown:
+                shown = f"{label} ({conf:.2f})"
+                print("→", label)          # ★ 여기에 원하는 동작을 연결
+                last_fire = time.time()
+                buf.clear()                # 같은 동작이 연달아 발화하는 것 방지
+
+        cv2.putText(frame, shown, (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 0), 3)
+        cv2.imshow("run", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ----------------------------------------------------------------
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("collect")
+    p.add_argument("--label", required=True)
+    p.add_argument("--n", type=int, default=30)
+    sub.add_parser("train")
+    sub.add_parser("run")
+
+    args = ap.parse_args()
+    if args.cmd == "collect":
+        collect(args.label, args.n)
+    elif args.cmd == "train":
+        train()
+    else:
+        run()
